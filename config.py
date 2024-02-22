@@ -1,0 +1,3 @@
+STOCK_LIST = [
+    
+]
