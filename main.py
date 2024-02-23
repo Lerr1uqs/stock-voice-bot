@@ -5,7 +5,11 @@ import time
 import pandas as pd
 from ashare import ashare
 import config
-from typing import Dict, List
+from typing import Dict, List, NoReturn
+from abc import abstractmethod
+from loguru import logger
+import collections
+collections.Callable = collections.abc.Callable
 
 ASTOCK_MORNING_START   = dttime(hour=9, minute=30, second=0)
 ASTOCK_MORNING_END     = dttime(hour=11, minute=30, second=0)
@@ -25,73 +29,132 @@ def text_to_speech(text):
     # 等待语音播放完成
     engine.runAndWait()
 
+from qywxbot import qywx as wx
+bot = wx.Bot()
+
+def log(text) -> None:
+    text_to_speech(text=text)
+    bot.send_msg(content=text)
+    
+
 codename = pd.read_csv("storage/codename.csv")
 
-def monitor(stock_minutes_data: Dict[str, pd.DataFrame]):
+def is_trader_period(t: dttime) -> bool:
 
-    for stock in config.STOCK_LIST:
+    if config.enable_test:
+        # 无视时间测试
+        return True
+        
+    return ASTOCK_MORNING_START <= t <= ASTOCK_MORNING_END or \
+            ASTOCK_AFTERNOON_START <= t <= ASTOCK_AFTERNOON_END
 
-        data = ashare.api.query_prices_untilnow(
-            security=stock,
-            frequency="1minute",
-            count=1
-        )
+class ApiClient:
 
-        history = stock_minutes_data[stock]
+    def __init__(self, stocks: List[str]) -> None:
+        self.stocks = stocks
 
-        if data.iloc[-1].index != history.iloc[-1].index:
+    @abstractmethod
+    def on_data(self, datas: Dict[str, pd.DataFrame]):
+        '''
+        datas为各个注册的股票的最新的数据
+        '''
+        pass
 
-            stock_minutes_data[stock] = pd.concat(
-                [history, data], axis=0
-            )
-            now = stock_minutes_data[stock]
-            # close_pctchg  = now["close"].pct_change()
-            # volume_pctchg = now["volume"].pct_change()
+class ApiServer:
+
+    def register_client(self, client: ApiClient):
+        self.client = client
+
+    @property
+    def trading_period(self):
+        now = Datetime.now()
+        return is_trader_period(now.time())
+
+    def fetching(self):
+        '''
+        日内的交易时间会fetching 否则则会退出
+        '''
+
+        while self.trading_period:
+
+            start = time.time()
+
+            datas = {}
+            for stock in self.client.stocks:
+                data = ashare.api.query_data_in_day(
+                    security=stock
+                )
+                # 这里只会拿到当天的数据
+                datas[stock] = data
+
+            # 回调函数
+            self.client.on_data(datas)
+            
+            end = time.time()
+
+            elapse = end - start
+
+            time.sleep(60-elapse)
+            
+    def run_forever(self) -> NoReturn:
+        while True:
+            time.sleep(10)
+
+class Monitor(ApiClient):
+    def on_data(self, datas: Dict[str, pd.DataFrame]):
+        
+        logger.debug("on_data trigger")
+
+        for stock in config.STOCK_LIST:
+            now = datas[stock]
 
             close_is_min = now["close"].iloc[-1] == now["close"].min()
             close_is_max = now["close"].iloc[-1] == now["close"].max()
 
-            name = codename[codename["ts_code"] == stock, "name"].iloc[0]
+            # TODO 要处理这种转换很麻烦 需要标准化
+            prefix = stock[0:2]
+            code = stock[2:]
+            stock = code + "." + prefix.upper()
+
+            name = codename[codename["ts_code"] == stock]["name"].iloc[0]
 
             if close_is_max:
-                text_to_speech(f"{name} reach its high")
+                log(f"{name} reach it's high {now['close'].max()}")
             elif close_is_min:
-                text_to_speech(f"{name} reach its low")
+                log(f"{name} reach it's low {now['close'].min()}")
+            else:
+                pass
+                # text_to_speech("sleep")
 
-        else:
-            continue
+server = ApiServer()
+server.register_client(Monitor(config.STOCK_LIST))
+
+def isopen() -> bool:
+
+    if config.enable_test:
+        return True
     
-    # 20s轮询一次
-    elapse = 20 - Datetime.now().time().second
-    time.sleep(elapse)
-
-def is_trader_period(t: dttime) -> bool:
-    return ASTOCK_MORNING_START <= t <= ASTOCK_MORNING_END or \
-            ASTOCK_AFTERNOON_START <= t <= ASTOCK_AFTERNOON_END
-
-while True:
-
-    time.sleep(60)
     now = Datetime.now()
     nows = now.strftime(r"%Y%m%d")
     
-    isopen = CALANDER.loc[CALANDER['cal_date'] == nows, 'is_open'].values[0]
+    return CALANDER.loc[CALANDER['cal_date'].astype(str) == nows, 'is_open'].values[0]
+
+if config.enable_test:
+    logger.warning("testing now")
+
+while True:
     
-    if isopen:
+    if isopen():
         # 一天之内
-        stock_minutes_data: Dict[str, pd.DataFrame] = {}
-        columns = ["open" ,"close", "high", "low", "volume"]
+        # stock_minutes_data: Dict[str, pd.DataFrame] = {}
+        # columns = ["open" ,"close", "high", "low", "volume"]
         
-        for stock in config.STOCK_LIST:
-            stock_minutes_data[stock] = pd.DataFrame(columns=columns)
+        # for stock in config.STOCK_LIST:
+        #     stock_minutes_data[stock] = pd.DataFrame(columns=columns)
 
-        while ASTOCK_MORNING_START <= now.time() <= ASTOCK_AFTERNOON_END:
-            if is_trader_period(Datetime.now().time()):
-                monitor(stock_minutes_data)
-            else:
-                time.sleep(20)
+        server.fetching()
         
-        # 收盘了
-        print("收盘")
+        logger.info("收盘")
 
+    time.sleep(60)
 
